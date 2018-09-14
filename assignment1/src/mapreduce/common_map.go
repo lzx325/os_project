@@ -1,14 +1,11 @@
 package mapreduce
 
-
 import (
+	"encoding/json"
 	"hash/fnv"
 	"io/ioutil"
 	"os"
 	"time"
-	"encoding/json"
-	"fmt"
-
 )
 
 // doMap does the job of a map worker: it reads one of the input files
@@ -47,30 +44,28 @@ func doMap(
 	//     err := enc.Encode(&kv)
 	//
 	// Remember to close the file after you have written all the values!
-	inFile_barr,err:=ioutil.ReadFile(inFile)
-	if err!=nil{
+	inFile_barr, err := ioutil.ReadFile(inFile)
+	if err != nil {
 		panic(err)
 	}
-	contents:=string(inFile_barr)
-	map_res:=mapF(inFile,contents)
-	fmt.Println(inFile)
-	reduce_inputs:=make([] map[string] string,nReduce)
-	for _,kv:=range(map_res){
-		map_ind:=ihash(kv.Key)%uint32(nReduce)
-		if reduce_inputs[map_ind]==nil{
-			reduce_inputs[map_ind]=make(map[string]string)
+	contents := string(inFile_barr)
+	map_res := mapF(inFile, contents)
+	reduce_inputs := make([]map[string]string, nReduce)
+	for _, kv := range map_res {
+		map_ind := ihash(kv.Key) % uint32(nReduce)
+		if reduce_inputs[map_ind] == nil {
+			reduce_inputs[map_ind] = make(map[string]string)
 		}
-		reduce_inputs[map_ind][kv.Key]=kv.Value
-		_=time.Sleep
+		reduce_inputs[map_ind][kv.Key] = kv.Value
+		_ = time.Sleep
 	}
-	for r,m:=range(reduce_inputs){
-		oname:=reduceName(jobName,mapTaskNumber,r)
-		fmt.Println(oname)
-		fh,err:=os.OpenFile(oname,os.O_WRONLY|os.O_TRUNC|os.O_CREATE,0644)
-		if err!=nil{
+	for r, m := range reduce_inputs {
+		oname := reduceName(jobName, mapTaskNumber, r)
+		fh, err := os.OpenFile(oname, os.O_WRONLY|os.O_TRUNC|os.O_CREATE, 0644)
+		if err != nil {
 			panic(err)
 		}
-		enc:=json.NewEncoder(fh)
+		enc := json.NewEncoder(fh)
 		enc.Encode(m)
 		fh.Close()
 	}
