@@ -1,16 +1,15 @@
 package mapreduce
 
 import (
-	"fmt"
-	"testing"
-	"time"
-
 	"bufio"
+	"fmt"
 	"log"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"testing"
+	"time"
 )
 
 const (
@@ -185,6 +184,7 @@ func TestOneFailure(t *testing.T) {
 }
 
 func TestManyFailures(t *testing.T) {
+	fmt.Println("TestMany")
 	mr := setup()
 	i := 0
 	done := false

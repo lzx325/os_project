@@ -1,8 +1,8 @@
 package mapreduce
-import(
-	"fmt"
-	"os"
+
+import (
 	"encoding/json"
+	"os"
 )
 
 // doReduce does the job of a reduce worker: it reads the intermediate
@@ -36,40 +36,40 @@ func doReduce(
 	// 	enc.Encode(KeyValue{key, reduceF(...)})
 	// }
 	// file.Close()
-	combined_map:=make(map[string] []string)
-	for i:=0;i<nMap;i++{
-		rname:=reduceName(jobName,i,reduceTaskNumber)
-		fh,err:=os.Open(rname)
-		if err!=nil{
+	combined_map := make(map[string][]string)
+	for i := 0; i < nMap; i++ {
+		rname := reduceName(jobName, i, reduceTaskNumber)
+		fh, err := os.Open(rname)
+		if err != nil {
 			panic(err)
 		}
-		dec:=json.NewDecoder(fh)
-		var m map[string] string
-		if err:=dec.Decode(&m);err!=nil{
+		dec := json.NewDecoder(fh)
+		var m map[string]string
+		if err := dec.Decode(&m); err != nil {
 			panic(err)
 		}
-		for k,v:=range(m){
-			combined_map[k]=append(combined_map[k],v)
+		for k, v := range m {
+			combined_map[k] = append(combined_map[k], v)
 		}
 		fh.Close()
 	}
 
-	result_map:=make(map[string] string)
-	for k,v:=range(combined_map){
-		result_map[k]=reduceF(k,v)
+	result_map := make(map[string]string)
+	for k, v := range combined_map {
+		result_map[k] = reduceF(k, v)
 	}
-	wname:=mergeName(jobName,reduceTaskNumber)
-	fmt.Println(wname)
-	fh,err:=os.OpenFile(wname,os.O_CREATE|os.O_TRUNC|os.O_WRONLY,0644)
-	if err!=nil{
+	wname := mergeName(jobName, reduceTaskNumber)
+	fh, err := os.OpenFile(wname, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+	if err != nil {
 		panic(err)
 	}
-	enc:=json.NewEncoder(fh)
-	if err:=enc.Encode(result_map);err!=nil{
-		panic(err)
+	enc := json.NewEncoder(fh)
+	for k, v := range result_map {
+		kv := KeyValue{k, v}
+		if err := enc.Encode(kv); err != nil {
+			panic(err)
+		}
 	}
 	fh.Close()
-
-
 
 }
