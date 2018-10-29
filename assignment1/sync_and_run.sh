@@ -24,7 +24,13 @@ sync(){
         $sync_command || { echo "rsync exited with status $?" 1>&2; return 1; }
     fi
 }
+<<<<<<< HEAD
 sync "$from_dir" "$to_dir" && ! [ -z "$run_command" ] &&
 { printf "\n################### execute run command ####################\n";
   ssh -t "$remote" "cd $to_dir_basename; $run_command"  || echo "ssh exited with status $?" 1>&2; 
+=======
+sync "$from_dir" "$to_dir" &&
+{ printf "\n################### execute run command ####################\n";
+  ssh -t "$remote" "cd $to_dir_basename; $run_command"  || echo "ssh exited with status $?" 1>&2;
+>>>>>>> 2cfe4f238e51919ce2f9ae4b832e4741e327d9ca
   exit 1; }
