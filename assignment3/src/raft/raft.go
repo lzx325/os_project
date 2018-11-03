@@ -72,11 +72,7 @@ type Raft struct {
 	log			map[int]*LogEntry
 	applyCh chan ApplyMsg
 	commitIndex int
-	electionTimeOutTimer *time.Timer
-	appendEntryArgsCh chan AppendEntriesArgs
-	appendEntryReplyCh chan *AppendEntriesReply
-	requestVoteArgsCh chan RequestVoteArgs
-	requestVoteReplyCh chan *RequestVoteReply
+	recievedRPC bool
 
 	stopServerCh chan int
 
@@ -87,21 +83,8 @@ type Raft struct {
 	votedFor int // use -1 when this server has not yet voted for anyone
 }
 
-func(rf *Raft) resetTimer(){
-	randDuration:=(rand.Intn(ELECTION_TIMEOUT)+ELECTION_TIMEOUT)*time.Millisecond
-	if rf.electionTimeOutTimer==nil{
-		rf.electionTimeOutTimer=time.Timer(randDuration)
-	}
-	if !rf.electionTimeOutTimer.Stop(){
-		<-rf.electionTimeOutTimer.C
-	}
-	rf.electionTimeOutTimer.Reset(randDuration)
-}
-
-func(rf *Raft) resetTimerLock(){
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.resetTimer()
+func(*Raft)electionTimeout(){
+	return (rand.Intn(ELECTION_TIMEOUT)+ELECTION_TIMEOUT)*time.Millisecond
 }
 
 
@@ -396,83 +379,73 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor=-1
 	
 	// start raft server
-	go func(){
-		rf.resetTimerLock()
-		for{
+	candidateFun:=function(){
+		for {
+			time.Sleep(rf.electionTimeout())
 			rf.mu.Lock()
-			switch rf.state{
-			case FOLLOWER:
-				rf.mu.Unlock()
-				loop:=true
-				for loop{
-					select{
-					case args:=<-rf.appendEntryArgsCh:
-						reply:=AppendEntriesReply{}
-						rf.appendEntries(args,&reply)
-						rf.appendEntryReplyCh<-&reply
-					case args:=<-rf.requestVoteArgsCh:
-						reply:=RequestVoteReply{}
-						rf.requestVote(args,&reply)
-						rf.requestVoteReplyCh<-&reply
-					case <-rf.electionTimeOutTimer.C:
-						rf.state=CANDIDATE
-						loop=false
-					case <-rf.stopServerCh:
-						return
-					}
-				}
-				
-			case LEADER:
-				rf.mu.Unlock()
-			case CANDIDATE:
-			
-				rf.currentTerm++
+			if rf.state != Leader && !rf.receivedRPC {
+				rf.state = CANDIDATE
+				rf.currentTerm += 1
+				rf.votedFor = rf.me
+				DPrintf("Term[%d] -- Peer[%d] changed to Candidate.\n", rf.currentTerm, rf.me)
 				rf.persist()
-				voteResultCh:=make(chan bool)
-
-				requestVoteRoutine:=func(){
+				go func(){
 					rf.mu.Lock()
-					defer rf.mu.Unlock()
-					votedServers:=[]int{}
-					// Vote self
-					votedServers=append(votedServers,rf.me)
-					rf.votedFor=rf.me
-					rf.persist()
-
-					// reset election timeout
-					rf.resetTimer()
-					
-
-				}
-				rf.mu.Unlock()
-
-				loop:=true
-				for loop{
-					select{
-					case args:=<-rf.appendEntryArgsCh:
-						reply:=AppendEntriesReply{}
-						rf.appendEntries(args,&reply)
-						rf.appendEntryReplyCh<-&reply
-					case args:=<-rf.requestVoteArgsCh:
-						reply:=RequestVoteReply{}
-						rf.requestVote(args,&reply)
-						rf.requestVoteReplyCh<-&reply
+					DPrintf("Term[%d] -- Peer[%d] handleElection(): begin...\n", term, rf.me)
+	
+					votedCh := make(chan bool)
+					args := RequestVoteArgs{rf.currentTerm, rf.me, len(rf.log)-1, rf.log[len(rf.log)-1].term}
+					for idx, _ := range rf.peers { // send vote request to everyone
+						if idx != rf.me {
+							go func(server int) {
+								reply := RequestVoteReply{-1, false}
+								ok := rf.sendRequestVote(server, &args, &reply)
+								rf.updateCurrentTerm(reply.Term)
+								select {
+								case votedCh <- ok && reply.VoteGranted:
+									DPrintf("Term[%d] -- Peer[%d] handleElection(): vote from [%d] - %v\n", 
+										term, rf.me, server, reply.VoteGranted)
+								case <- time.After(100 * time.Millisecond):
+									// election already finished.
+								}
+							}(idx)
+						}
 					}
-					rf.mu.Lock()
-					if rf.state!=CANDIDATE{
-						rf.mu.Unlock()
-						loop=false
-					} else{
+					rf.mu.Unlock()
+					DPrintf("Term[%d] -- Peer[%d] handleElection(): waiting votes .\n", term, rf.me)
+					total := len(rf.peers)
+					receivedVotes := 1 	// 1 vote for self
+					for i := 0; i < total - 1; i++ {
+						if <- votedChan {
+							receivedVotes += 1
+						}
+						if receivedVotes >= (total + 1) / 2 {
+							break
+						}
+					}
+				
+					DPrintf("Term[%d] -- Peer[%d] handleElection(): received votes [%d/%d].\n", 
+						term, rf.me, receivedVotes, total)
+				
+					if receivedVotes >= (total + 1) / 2 {
+						rf.mu.Lock()
+						if rf.state == Candidate && term >= rf.currentTerm {
+							rf.state = Leader
+							rf.nextIndex = make([]int, len(rf.peers))
+							rf.matchIndex = make([]int, len(rf.peers))
+							for idx, _ := range rf.nextIndex {
+								rf.nextIndex[idx] = rf.getLogLength()
+							}
+							DPrintf("Term[%d] -- Peer[%d] changed to Leader.\n", rf.currentTerm, rf.me)
+						}
 						rf.mu.Unlock()
 					}
-				}
-							
-			default:
-				rf.mu.Unlock()
-				log.Fatal("Unknown state "+strconv.Itoa(rf.state))
+				}()
 			}
+			rf.recievedRPC = false
+			rf.mu.Unlock()
 		}
-	}()
+	}
 
 
 	return rf

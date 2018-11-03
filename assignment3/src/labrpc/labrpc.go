@@ -78,19 +78,20 @@ type ClientEnd struct {
 // send an RPC, wait for the reply.
 // the return value indicates success; false means the
 // server couldn't be contacted.
+// svcMeth: rpc method name
 func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bool {
 	req := reqMsg{}
 	req.endname = e.endname
 	req.svcMeth = svcMeth
 	req.argsType = reflect.TypeOf(args)
-	req.replyCh = make(chan replyMsg)
+	req.replyCh = make(chan replyMsg) // rpc call will wait on this channel
 
 	qb := new(bytes.Buffer)
 	qe := gob.NewEncoder(qb)
 	qe.Encode(args)
 	req.args = qb.Bytes()
 
-	e.ch <- req
+	e.ch <- req // send the reqMsg to main network channel
 
 	rep := <-req.replyCh
 	if rep.ok {
@@ -105,12 +106,13 @@ func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bo
 	}
 }
 
+// Network has Servers, Servers have Services
 type Network struct {
 	mu             sync.Mutex
-	reliable       bool
+	reliable       bool                        // network reliability. If not, the network may experience delay and random message dropping
 	longDelays     bool                        // pause a long time on send on disabled connection
 	longReordering bool                        // sometimes delay replies a long time
-	ends           map[interface{}]*ClientEnd  // ends, by name
+	ends           map[interface{}]*ClientEnd  // ends, by name. One end for each server, used by raft object for rpc calls.
 	enabled        map[interface{}]bool        // by end name
 	servers        map[interface{}]*Server     // servers, by name
 	connections    map[interface{}]interface{} // endname -> servername
@@ -120,16 +122,16 @@ type Network struct {
 func MakeNetwork() *Network {
 	rn := &Network{}
 	rn.reliable = true
-	rn.ends = map[interface{}]*ClientEnd{}
-	rn.enabled = map[interface{}]bool{}
-	rn.servers = map[interface{}]*Server{}
-	rn.connections = map[interface{}](interface{}){}
-	rn.endCh = make(chan reqMsg)
+	rn.ends = map[interface{}]*ClientEnd{}           // this is a empty map literal. mapping from endname to clientend object
+	rn.enabled = map[interface{}]bool{}              // mapping from endname to bool
+	rn.servers = map[interface{}]*Server{}           // mapping from servername to server object
+	rn.connections = map[interface{}](interface{}){} // mapping from end name to servername
+	rn.endCh = make(chan reqMsg)                     //all rpc calls will be sent through this channel
 
 	// single goroutine to handle all ClientEnd.Call()s
 	go func() {
 		for xreq := range rn.endCh {
-			go rn.ProcessReq(xreq)
+			go rn.ProcessReq(xreq) // parallelize request handling
 		}
 	}()
 
@@ -186,15 +188,15 @@ func (rn *Network) IsServerDead(endname interface{}, servername interface{}, ser
 func (rn *Network) ProcessReq(req reqMsg) {
 	enabled, servername, server, reliable, longreordering := rn.ReadEndnameInfo(req.endname)
 
-	if enabled && servername != nil && server != nil {
+	if enabled && servername != nil && server != nil { // case: server is set up and enbabled
 		if reliable == false {
-			// short delay
+			// short delay. network delay.
 			ms := (rand.Int() % 27)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		}
 
-		if reliable == false && (rand.Int()%1000) < 100 {
-			// drop the request, return as if timeout
+		if reliable == false && (rand.Int()%1000) < 100 { // 10% probability
+			// drop the request, return as if timeout. Message lost during communication
 			req.replyCh <- replyMsg{false, nil}
 			return
 		}
@@ -205,7 +207,7 @@ func (rn *Network) ProcessReq(req reqMsg) {
 		// failure reply.
 		ech := make(chan replyMsg)
 		go func() {
-			r := server.dispatch(req)
+			r := server.dispatch(req) // req is an reqMsg. retval is an replyMsg.
 			ech <- r
 		}()
 
@@ -219,7 +221,7 @@ func (rn *Network) ProcessReq(req reqMsg) {
 			select {
 			case reply = <-ech:
 				replyOK = true
-			case <-time.After(100 * time.Millisecond):
+			case <-time.After(100 * time.Millisecond): //test whether server is dead after 100ms
 				serverDead = rn.IsServerDead(req.endname, servername, server)
 			}
 		}
@@ -331,8 +333,8 @@ func (rn *Network) GetCount(servername interface{}) int {
 //
 type Server struct {
 	mu       sync.Mutex
-	services map[string]*Service
-	count    int // incoming RPCs
+	services map[string]*Service // handle multiple services. RPC call will use servicename.methodname to locate each method. But normally there is only one service registered???
+	count    int                 // incoming RPCs
 }
 
 func MakeServer() *Server {
@@ -438,7 +440,7 @@ func (svc *Service) dispatch(methname string, req reqMsg) replyMsg {
 
 		// call the method.
 		function := method.Func
-		function.Call([]reflect.Value{svc.rcvr, args.Elem(), replyv})
+		function.Call([]reflect.Value{svc.rcvr, args.Elem(), replyv}) // here is the place to call raft methods
 
 		// encode the reply.
 		rb := new(bytes.Buffer)
