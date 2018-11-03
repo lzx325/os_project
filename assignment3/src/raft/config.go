@@ -27,17 +27,18 @@ func randstring(n int) string {
 }
 
 type config struct {
-	mu        sync.Mutex
+	mu        sync.Mutex // monitor lock for this struct
 	t         *testing.T
 	net       *labrpc.Network
 	n         int
-	done      int32 // tell internal threads to die
-	rafts     []*Raft
-	applyErr  []string // from apply channel readers
-	connected []bool   // whether each server is on the net
-	saved     []*Persister
-	endnames  [][]string    // the port file names each sends to
-	logs      []map[int]int // copy of each server's committed entries
+	done      int32        // tell internal threads to die
+	rafts     []*Raft      // raft servers
+	applyErr  []string     // from apply channel readers
+	connected []bool       // whether each server is on the net
+	saved     []*Persister // the persister reference stored in this array is also stored in raft object, therefore, the raft methods can modify.
+	// but once a new raft server is started, the persister object is copied.
+	endnames [][]string    // the port file names each sends to
+	logs     []map[int]int // copy of each server's committed entries
 }
 
 func make_config(t *testing.T, n int, unreliable bool) *config {
@@ -140,7 +141,8 @@ func (cfg *config) start1(i int) {
 
 	cfg.mu.Unlock()
 
-	// listen to messages from Raft indicating newly committed messages.
+	// listen to messages from Raft indicating newly committed messages. And bookkeep them in cfg.logs and cfg.applyErr.
+
 	applyCh := make(chan ApplyMsg)
 	go func() {
 		for m := range applyCh {
@@ -149,9 +151,11 @@ func (cfg *config) start1(i int) {
 				// ignore the snapshot
 			} else if v, ok := (m.Command).(int); ok {
 				cfg.mu.Lock()
+
+				// check all the raft server's m.Index entry if they have committed a different value
 				for j := 0; j < len(cfg.logs); j++ {
 					if old, oldok := cfg.logs[j][m.Index]; oldok && old != v {
-						// some server has already committed a different value for this entry!
+						// error case 1: some server has already committed a different value for this entry!
 						err_msg = fmt.Sprintf("commit index=%v server=%v %v != server=%v %v",
 							m.Index, i, m.Command, j, old)
 					}
@@ -161,12 +165,14 @@ func (cfg *config) start1(i int) {
 				cfg.mu.Unlock()
 
 				if m.Index > 1 && prevok == false {
+					// error case 2
 					err_msg = fmt.Sprintf("server %v apply out of order %v", i, m.Index)
 				}
 			} else {
+				// error case 3
 				err_msg = fmt.Sprintf("committed command %v is not an int", m.Command)
 			}
-
+			// because the value m tunnelled through applyCh are already commited, it should not contain the error case from 1-3
 			if err_msg != "" {
 				log.Fatalf("apply error: %v\n", err_msg)
 				cfg.applyErr[i] = err_msg
@@ -379,7 +385,7 @@ func (cfg *config) wait(index int, n int, startTerm int) interface{} {
 // same value, since nCommitted() checks this,
 // as do the threads that read from applyCh.
 // returns index.
-func (cfg *config) one(cmd int, expectedServers int) int {
+func (cfg *config) one(cmd int, expectedServers int) int { // expectedServers: # of expected raft servers
 	t0 := time.Now()
 	starts := 0
 	for time.Since(t0).Seconds() < 10 {

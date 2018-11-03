@@ -1,0 +1,868 @@
+package raft
+
+//
+// this is an outline of the API that raft must expose to
+// the service (or tester). see comments below for
+// each of these functions for more details.
+//
+// rf = Make(...)
+//   create a new Raft server.
+// rf.Start(command interface{}) (index, term, isleader)
+//   start agreement on a new log entry
+// rf.GetState() (term, isLeader)
+//   ask a Raft for its current term, and whether it thinks it is leader
+// ApplyMsg
+//   each time a new entry is committed to the log, each Raft peer
+//   should send an ApplyMsg to the service (or tester)
+//   in the same server.
+//
+
+import (
+	"bytes"
+	"encoding/gob"
+	"fmt"
+	"labrpc"
+	"log"
+	"math/rand"
+	"sync"
+	"time"
+)
+
+const InvalidID = -1
+
+type StatusEnum int
+
+const (
+	Follower StatusEnum = iota
+	Candidate
+	Leader
+)
+
+const (
+	TimeoutElecation = 300 * time.Millisecond
+	TimeoutBroadcast = 200 * time.Millisecond
+	TimeoutStep      = 10 * time.Millisecond
+)
+
+//
+// as each Raft peer becomes aware that successive log entries are
+// committed, the peer should send an ApplyMsg to the service (or
+// tester) on the same server, via the applyCh passed to Make().
+//
+type ApplyMsg struct {
+	Index       int
+	Command     interface{}
+	UseSnapshot bool   // ignore for lab2; only used in lab3
+	Snapshot    []byte // ignore for lab2; only used in lab3
+}
+
+type LogEntryReply struct {
+	Index  int
+	Term   int
+	Status StatusEnum
+}
+
+type LogEntry struct {
+	Index   int
+	Term    int
+	Command interface{}
+
+	matchs []int
+	respc  chan LogEntryReply
+}
+
+type NotifyTimer struct {
+	mu     sync.Mutex
+	out    chan struct{}
+	end    chan struct{}
+	timer  *time.Timer
+	closed bool
+}
+
+type StatusPair struct {
+	Term   int
+	Status StatusEnum
+}
+
+type BroadcastReq struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
+
+	respc chan BroadcastReply
+}
+
+type BroadcastReply struct {
+	PeerId    int
+	Term      int
+	LeaderID  int
+	LastIndex int
+	Success   bool
+	hasLog    bool
+}
+
+//
+// example RequestVote RPC arguments structure.
+//
+type RequestVoteArgs struct {
+	Term         int
+	CandidateID  int
+	LastLogIndex int
+	LastLogTerm  int
+
+	respc chan RequestVoteReply
+}
+
+//
+// example RequestVote RPC reply structure.
+//
+type RequestVoteReply struct {
+	Term        int
+	VoteGranted bool
+}
+
+//
+// A Go object implementing a single Raft peer.
+//
+type Raft struct {
+	mu        sync.Mutex
+	peers     []*labrpc.ClientEnd
+	persister *Persister
+	me        int // index into peers[]
+
+	status StatusEnum
+
+	applyMsg chan ApplyMsg
+
+	currentTerm   int
+	votedFor      int
+	logs          []LogEntry
+	commitIndex   int
+	lastApplied   int
+	mostNum       int
+	nextIndex     []int
+	matchIndex    []int
+	leaderID      int
+	recvVoteCount int
+
+	election             chan struct{}         // 选举
+	recvElection         chan RequestVoteReply // 收到投票响应
+	reqVote              chan RequestVoteArgs  // 收到投票请求
+	recvBroadcastReply   chan BroadcastReply   // 收到广播响应
+	reqBoradcast         chan BroadcastReq     // 收到广播请求
+	broadcast            chan struct{}         // 广播
+	broadcastEnd         chan struct{}         // 停止广播
+	commitMsg            chan struct{}         // 提交
+	resetElectionTimeout chan struct{}         // 重置选举超时时间
+	stop                 chan struct{}         // 停止
+	statusc              chan StatusPair       // 获取状态
+	recvCommand          chan LogEntry         // 接受客户端命令
+	debugc               chan struct{}         // 打印调试状态
+
+	electionTimeout *NotifyTimer
+	broadcastTicker *time.Ticker
+}
+
+func randomElectionTime(num int) time.Duration {
+	time := TimeoutElecation + time.Duration(int64(TimeoutStep)*rand.Int63n(int64(num+10)))
+	return time
+}
+
+func startTimer(duration time.Duration, out chan struct{}) *NotifyTimer {
+	timer := time.NewTimer(duration)
+	ntimer := &NotifyTimer{
+		timer:  timer,
+		out:    out,
+		end:    make(chan struct{}),
+		closed: false,
+	}
+
+	go func() {
+		defer func() {
+			ntimer.mu.Lock()
+			ntimer.closed = true
+			ntimer.mu.Unlock()
+			close(ntimer.end)
+		}()
+
+		select {
+		case <-ntimer.timer.C:
+			ntimer.mu.Lock()
+			closed := ntimer.closed
+			ntimer.mu.Unlock()
+			if !closed {
+				ntimer.out <- struct{}{}
+			}
+			break
+		case <-ntimer.end:
+			ntimer.timer.Stop()
+			ntimer.timer = nil
+			break
+		}
+	}()
+
+	return ntimer
+}
+
+func (nt *NotifyTimer) stopTimer() {
+	nt.mu.Lock()
+	defer nt.mu.Unlock()
+	if nt.timer != nil && !nt.closed {
+		nt.closed = true
+		nt.end <- struct{}{}
+	}
+}
+
+func (rf *Raft) resetElectionTimer() {
+	if rf.electionTimeout != nil {
+		go rf.electionTimeout.stopTimer()
+	}
+	timeout := randomElectionTime(len(rf.peers))
+	rf.electionTimeout = startTimer(timeout, rf.election)
+}
+
+// return currentTerm and whether this server
+// believes it is the leader.
+func (rf *Raft) GetState() (int, bool) {
+	rf.statusc <- StatusPair{}
+	status := <-rf.statusc
+	return status.Term, status.Status == Leader
+}
+
+//
+// save Raft's persistent state to stable storage,
+// where it can later be retrieved after a crash and restart.
+// see paper's Figure 2 for a description of what should be persistent.
+//
+func (rf *Raft) persist() {
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+
+	rf.mu.Lock()
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	rf.mu.Unlock()
+
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+}
+
+//
+// restore previously persisted state.
+//
+func (rf *Raft) readPersist(data []byte) {
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+
+	rf.mu.Lock()
+	d.Decode(&rf.currentTerm)
+	d.Decode(&rf.votedFor)
+	d.Decode(&rf.logs)
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) close() {
+	if rf.electionTimeout != nil {
+		go rf.electionTimeout.stopTimer()
+	}
+
+	rf.broadcastTicker.Stop()
+
+	// close(rf.election)
+	// close(rf.recvElection)
+	// close(rf.reqVote)
+	// close(rf.broadcast)
+	// close(rf.commitMsg)
+	// close(rf.resetElectionTimeout)
+	// close(rf.statusc)
+	// close(rf.stop)
+}
+
+func (rf *Raft) startRaft() {
+	go func() {
+		defer rf.close()
+
+		rf.resetElectionTimer()
+
+		for {
+			select {
+			case <-rf.election: // 选举
+				rf.resetElectionTimer()
+				rf.startElection()
+				break
+			case reply := <-rf.recvElection: // 收到投票
+				rf.resetElectionTimer()
+				rf.processElectionReply(&reply)
+				break
+			case req := <-rf.reqVote: // 收到投票请求
+				rf.resetElectionTimer()
+				rf.processElectionReq(&req)
+				break
+			case command := <-rf.recvCommand: // 收到客户端请求
+				rf.processClientCommand(&command)
+				break
+			case <-rf.broadcast: // 广播
+				if rf.status == Leader {
+					rf.resetElectionTimer()
+					rf.startBroadcast()
+				}
+				break
+			case reply := <-rf.recvBroadcastReply: //收到广播响应
+				rf.processBroadcastReply(&reply)
+				break
+			case req := <-rf.reqBoradcast: // 收到广播请求
+				rf.resetElectionTimer()
+				rf.processBroadcastReq(&req)
+				break
+			case <-rf.commitMsg: // 提交, // TODO ... 提交的 goroutine 应该独立出来
+				rf.commitLogs()
+				break
+			case <-rf.resetElectionTimeout: // 重置选举超时时间
+				rf.resetElectionTimer()
+				break
+			case <-rf.statusc: // 获取状态
+				rf.statusc <- StatusPair{
+					Term:   rf.currentTerm,
+					Status: rf.status,
+				}
+				break
+			case <-rf.debugc:
+				log.Println("Debug: ", rf.me, rf.commitIndex, rf.lastApplied, rf.currentTerm, rf.status, rf.leaderID, rf.logs)
+				break
+			case <-rf.stop: // 停止
+				return
+			}
+
+			rf.persist()
+		}
+	}()
+
+	// start broadcast ticker.
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.broadcastTicker == nil {
+		rf.broadcastTicker = time.NewTicker(TimeoutBroadcast)
+		go func() {
+			defer close(rf.broadcastEnd)
+			for {
+				select {
+				case <-rf.broadcastTicker.C:
+					rf.broadcast <- struct{}{}
+					break
+				case <-rf.broadcastEnd:
+					rf.broadcastTicker.Stop()
+					return
+				}
+			}
+		}()
+	}
+}
+
+func (rf *Raft) startNewTerm() {
+	rf.currentTerm++
+}
+
+func (rf *Raft) resetNextIndex() {
+	plen := len(rf.peers)
+	rf.nextIndex = make([]int, plen)
+	rf.matchIndex = make([]int, plen)
+	logLen := len(rf.logs)
+	for i := 0; i < plen; i++ {
+		rf.nextIndex = append(rf.nextIndex, logLen-1)
+		rf.matchIndex = append(rf.nextIndex, 0)
+	}
+}
+
+func (rf *Raft) beLeader() {
+	if rf.status != Leader {
+		rf.status = Leader
+		rf.votedFor = rf.me
+		rf.leaderID = rf.me
+		rf.resetNextIndex()
+		rf.broadcast <- struct{}{}
+	}
+}
+
+func (rf *Raft) processElectionReq(req *RequestVoteArgs) {
+	if rf.status == Candidate &&
+		(req.Term > rf.currentTerm ||
+			(req.Term == rf.currentTerm &&
+				(rf.votedFor == InvalidID ||
+					rf.votedFor == req.CandidateID))) {
+		lastLogIndex := 0
+		lastLogTerm := 0
+		if len(rf.logs) > 0 {
+			lastLog := rf.logs[len(rf.logs)-1]
+			lastLogIndex = lastLog.Index
+			lastLogTerm = lastLog.Term
+		}
+
+		if lastLogTerm < req.LastLogTerm ||
+			(lastLogTerm == req.LastLogTerm && lastLogIndex <= req.LastLogIndex) {
+			rf.votedFor = req.CandidateID
+			rf.currentTerm = req.Term
+			rf.persist()
+
+			req.respc <- RequestVoteReply{
+				Term:        rf.currentTerm,
+				VoteGranted: true,
+			}
+			return
+		}
+	}
+
+	req.respc <- RequestVoteReply{
+		Term:        rf.currentTerm,
+		VoteGranted: false,
+	}
+}
+
+func (rf *Raft) processElectionReply(reply *RequestVoteReply) {
+	if reply.VoteGranted && reply.Term == rf.currentTerm {
+		rf.recvVoteCount++
+	} else {
+		if reply.Term > rf.currentTerm {
+			rf.recvVoteCount = 0
+			rf.currentTerm = reply.Term
+			rf.persist()
+		}
+	}
+
+	if rf.recvVoteCount >= rf.mostNum {
+		rf.beLeader()
+	}
+}
+
+func (rf *Raft) processBroadcastReq(req *BroadcastReq) {
+	if req.Term < rf.currentTerm {
+		req.respc <- BroadcastReply{
+			Term:     rf.currentTerm,
+			LeaderID: rf.leaderID,
+			Success:  false,
+			hasLog:   false,
+		}
+		return
+	}
+
+	if rf.status != Follower {
+		rf.status = Follower
+	}
+
+	// if req.Term > rf.currentTerm {
+	rf.currentTerm = req.Term
+	// }
+	rf.leaderID = req.LeaderId
+
+	reply := BroadcastReply{
+		PeerId:    rf.me,
+		Term:      rf.currentTerm,
+		LeaderID:  rf.leaderID,
+		LastIndex: 0,
+		Success:   false,
+		hasLog:    false,
+	}
+
+	entryLen := len(req.Entries)
+	logLen := len(rf.logs)
+	if entryLen > 0 {
+		reply.hasLog = true
+
+		if req.PrevLogIndex == 0 && req.PrevLogTerm == 0 {
+			rf.logs = rf.logs[0:0]
+			logLen = 0
+		}
+
+		if logLen > 0 {
+			lastLog := rf.logs[logLen-1]
+			reply.LastIndex = lastLog.Index
+			if logLen < req.PrevLogIndex || req.PrevLogIndex <= 0 {
+				req.respc <- reply
+				log.Fatalln("RejectRecvLog1: ", rf.me, logLen, req, rf.logs)
+				return
+			}
+
+			prevLog := &rf.logs[req.PrevLogIndex-1]
+			if prevLog == nil {
+				req.respc <- reply
+				log.Fatalln("RejectRecvLog2: ", rf.me, logLen, req, rf.logs)
+				return
+			}
+			if prevLog.Term != req.PrevLogTerm {
+				if rf.commitIndex > req.PrevLogIndex {
+					log.Fatalln("RejectRecvLog66: ", rf.me, rf.commitIndex, logLen, req, rf.logs)
+				}
+				rf.logs = rf.logs[:req.PrevLogIndex-1]
+				if len(rf.logs) > 0 {
+					reply.LastIndex = rf.logs[len(rf.logs)-1].Index
+				} else {
+					reply.LastIndex = 0
+				}
+				req.respc <- reply
+				log.Fatalln("RejectRecvLog5: ", rf.me, logLen, req, rf.logs)
+				return
+			}
+		}
+		if len(rf.logs) == 0 && req.PrevLogIndex != 0 {
+			req.respc <- reply
+			log.Fatalln("RejectRecvLog3: ", rf.me, logLen, req, rf.logs)
+			return
+		}
+
+		if len(rf.logs) > req.PrevLogIndex {
+			rf.logs = rf.logs[:req.PrevLogIndex]
+		}
+
+		for i := 0; i < entryLen; i++ {
+			rf.logs = append(rf.logs, req.Entries[i])
+		}
+		rf.persist()
+
+		rf.commitIndex = req.LeaderCommit
+
+		reply.LastIndex = rf.logs[len(rf.logs)-1].Index
+
+		if rf.commitIndex > reply.LastIndex {
+			log.Fatalln("LogCommitIndexError: ", rf.me, rf.commitIndex, reply.LastIndex, req, rf.logs)
+		}
+	}
+
+	if len(rf.logs) > 0 {
+		reply.LastIndex = rf.logs[len(rf.logs)-1].Index
+	}
+
+	reply.Success = true
+	req.respc <- reply
+
+	if rf.commitIndex < req.LeaderCommit {
+		num := rf.logs[len(rf.logs)-1].Index
+		if num > req.LeaderCommit {
+			num = req.LeaderCommit
+		}
+		rf.commitIndex = num
+	}
+	if rf.lastApplied < rf.commitIndex {
+		rf.commitMsg <- struct{}{}
+	}
+}
+
+func (rf *Raft) processBroadcastReply(reply *BroadcastReply) {
+	if rf.status != Leader {
+		return
+	}
+	if reply.Success {
+		if reply.LastIndex > rf.nextIndex[reply.PeerId] {
+			rf.nextIndex[reply.PeerId] = reply.LastIndex
+		}
+		for i := rf.commitIndex; i < reply.LastIndex; i++ {
+			log := &rf.logs[i]
+			if len(log.matchs) <= 0 {
+				log.matchs = make([]int, len(rf.peers))
+				for i := 0; i < len(log.matchs); i++ {
+					log.matchs[i] = 0
+				}
+			}
+			log.matchs[reply.PeerId] = 1
+			count := 0
+			for j := 0; j < len(log.matchs); j++ {
+				if j == rf.me || log.matchs[j] == 1 {
+					count++
+				}
+			}
+			if count >= rf.mostNum && log.Term == rf.currentTerm && rf.commitIndex < log.Index {
+				rf.commitIndex = log.Index
+			}
+		}
+
+		rf.commitMsg <- struct{}{}
+	} else {
+		if rf.currentTerm < reply.Term {
+			rf.status = Follower
+			rf.currentTerm = reply.Term
+			rf.leaderID = reply.LeaderID
+			rf.persist()
+		} else {
+			if reply.hasLog && rf.nextIndex[reply.PeerId] > 0 {
+				rf.nextIndex[reply.PeerId] = reply.LastIndex
+			}
+		}
+	}
+}
+
+func (rf *Raft) commitLogs() {
+	lastIndex := 0
+	for i := 0; i < len(rf.logs); i++ {
+		if rf.logs[i].Index != (lastIndex + 1) {
+			log.Fatalln("Log Index Error: ", rf.me, rf.status, rf.commitIndex, rf.lastApplied, rf.logs)
+		}
+		lastIndex++
+	}
+
+	if len(rf.logs) > 0 && rf.commitIndex > rf.lastApplied {
+		for i := rf.lastApplied; i < rf.commitIndex; i++ {
+			log := rf.logs[i]
+			// go func() {
+			rf.applyMsg <- ApplyMsg{
+				Index:   log.Index,
+				Command: log.Command,
+			}
+			// }()
+		}
+		rf.lastApplied = rf.commitIndex
+	}
+}
+
+func (rf *Raft) startElection() {
+	rf.startNewTerm()
+	rf.persist()
+	rf.status = Candidate
+	rf.leaderID = InvalidID
+	rf.votedFor = rf.me
+	rf.recvVoteCount = 0
+
+	req := RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateID:  rf.me,
+		LastLogIndex: 0,
+		LastLogTerm:  0,
+	}
+	if len(rf.logs) > 0 {
+		lastLog := rf.logs[len(rf.logs)-1]
+		req.LastLogIndex = lastLog.Index
+		req.LastLogTerm = lastLog.Term
+	}
+
+	// vote self
+	rf.recvVoteCount = 1
+
+	for s := 0; s < len(rf.peers); s++ {
+		if s != rf.me {
+			ss := s
+			go func() {
+				resp := RequestVoteReply{}
+				ok := rf.sendRequestVote(ss, req, &resp)
+				if ok {
+					rf.recvElection <- resp
+				} else {
+					fmt.Errorf("RPC(%d->%d) Call Error !!!", rf.me, ss)
+				}
+			}()
+		}
+	}
+}
+
+func (rf *Raft) startBroadcast() {
+	term := rf.currentTerm
+	me := rf.me
+	logs := rf.logs
+	logLen := len(logs)
+	commitIndex := rf.commitIndex
+
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me {
+			ii := i
+			go func() {
+				req := BroadcastReq{
+					Term:         term,
+					LeaderId:     me,
+					PrevLogIndex: 0,
+					PrevLogTerm:  0,
+					Entries:      []LogEntry{},
+					LeaderCommit: commitIndex,
+				}
+
+				if logLen > 0 && logLen > rf.nextIndex[ii] {
+					var prevLog *LogEntry
+					if rf.nextIndex[ii]-1 >= 0 {
+						prevLog = &logs[rf.nextIndex[ii]-1]
+					}
+					if prevLog != nil {
+						req.PrevLogIndex = prevLog.Index
+						req.PrevLogTerm = prevLog.Term
+					}
+					for j := rf.nextIndex[ii]; j < logLen; j++ {
+						req.Entries = append(req.Entries, logs[j])
+					}
+				}
+
+				reply := BroadcastReply{}
+				ok := rf.sendBroadcast(ii, req, &reply)
+				if ok {
+					rf.recvBroadcastReply <- reply
+				}
+			}()
+		}
+	}
+}
+
+//
+// example RequestVote RPC handler.
+//
+func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
+	args.respc = make(chan RequestVoteReply)
+	rf.reqVote <- args
+
+	resp := <-args.respc
+	reply.Term = resp.Term
+	reply.VoteGranted = resp.VoteGranted
+}
+
+func (rf *Raft) AppendEntries(args BroadcastReq, reply *BroadcastReply) {
+	args.respc = make(chan BroadcastReply)
+	rf.reqBoradcast <- args
+
+	resp := <-args.respc
+	reply.LastIndex = resp.LastIndex
+	reply.LeaderID = resp.LeaderID
+	reply.Success = resp.Success
+	reply.Term = resp.Term
+	reply.PeerId = resp.PeerId
+}
+
+//
+// example code to send a RequestVote RPC to a server.
+// server is the index of the target server in rf.peers[].
+// expects RPC arguments in args.
+// fills in *reply with RPC reply, so caller should
+// pass &reply.
+// the types of the args and reply passed to Call() must be
+// the same as the types of the arguments declared in the
+// handler function (including whether they are pointers).
+//
+// returns true if labrpc says the RPC was delivered.
+//
+// if you're having trouble getting RPC to work, check that you've
+// capitalized all field names in structs passed over RPC, and
+// that the caller passes the address of the reply struct with &, not
+// the struct itself.
+//
+func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *RequestVoteReply) bool {
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendBroadcast(server int, args BroadcastReq, reply *BroadcastReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+//
+// the service using Raft (e.g. a k/v server) wants to start
+// agreement on the next command to be appended to Raft's log. if this
+// server isn't the leader, returns false. otherwise start the
+// agreement and return immediately. there is no guarantee that this
+// command will ever be committed to the Raft log, since the leader
+// may fail or lose an election.
+//
+// the first return value is the index that the command will appear at
+// if it's ever committed. the second return value is the current
+// term. the third return value is true if this server believes it is
+// the leader.
+//
+func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	entry := LogEntry{
+		Index:   0,
+		Term:    0,
+		Command: command,
+		respc:   make(chan LogEntryReply, 1),
+	}
+
+	rf.recvCommand <- entry
+
+	reply := <-entry.respc
+
+	return reply.Index, reply.Term, reply.Status == Leader
+}
+
+func (rf *Raft) debug() {
+	rf.debugc <- struct{}{}
+}
+
+func (rf *Raft) processClientCommand(entry *LogEntry) {
+	index := -1
+	term := rf.currentTerm
+	status := rf.status
+
+	if status == Leader {
+		index = 1
+		if len(rf.logs) > 0 {
+			lastLog := rf.logs[len(rf.logs)-1]
+			index = lastLog.Index + 1
+		}
+
+		entry.Index = index
+		entry.Term = term
+		rf.logs = append(rf.logs, *entry)
+		rf.persist()
+	}
+
+	entry.respc <- LogEntryReply{
+		Index:  index,
+		Term:   term,
+		Status: status,
+	}
+}
+
+//
+// the tester calls Kill() when a Raft instance won't
+// be needed again. you are not required to do anything
+// in Kill(), but it might be convenient to (for example)
+// turn off debug output from this instance.
+//
+func (rf *Raft) Kill() {
+	rf.stop <- struct{}{}
+}
+
+//
+// the service or tester wants to create a Raft server. the ports
+// of all the Raft servers (including this one) are in peers[]. this
+// server's port is peers[me]. all the servers' peers[] arrays
+// have the same order. persister is a place for this server to
+// save its persistent state, and also initially holds the most
+// recent saved state, if any. applyCh is a channel on which the
+// tester or service expects Raft to send ApplyMsg messages.
+// Make() must return quickly, so it should start goroutines
+// for any long-running work.
+//
+func Make(peers []*labrpc.ClientEnd, me int,
+	persister *Persister, applyCh chan ApplyMsg) *Raft {
+	rf := &Raft{}
+	rf.peers = peers
+	rf.persister = persister
+	rf.me = me
+
+	rf.applyMsg = applyCh
+
+	rf.currentTerm = 0
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.votedFor = InvalidID
+	rf.leaderID = InvalidID
+	rf.mostNum = len(rf.peers)/2 + 1
+
+	rf.election = make(chan struct{}, 1)                 // 选举
+	rf.broadcast = make(chan struct{}, 1)                // 广播
+	rf.commitMsg = make(chan struct{}, 20*len(rf.peers)) // 提交
+	rf.recvElection = make(chan RequestVoteReply, 1)     // 收到投票
+	rf.reqVote = make(chan RequestVoteArgs, 1)           // 收到投票请求
+	rf.broadcastEnd = make(chan struct{}, 1)             // 停止广播
+	rf.resetElectionTimeout = make(chan struct{}, 1)     // 重置选举超时时间
+	rf.statusc = make(chan StatusPair, 1)                // 获取状态
+	rf.recvBroadcastReply = make(chan BroadcastReply, 1) // 收到广播响应
+	rf.reqBoradcast = make(chan BroadcastReq, 1)         // 收到广播请求
+	rf.stop = make(chan struct{}, 1)                     // 停止
+	rf.recvCommand = make(chan LogEntry, 10)             // 接受客户端请求
+	rf.debugc = make(chan struct{}, 1)                   // 打印调试状态
+
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
+
+	rf.resetNextIndex()
+
+	rf.startRaft()
+
+	return rf
+}
