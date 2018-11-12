@@ -105,19 +105,19 @@ func randElectionTimeout() time.Duration {
 	return time.Duration(randTimeout) * time.Millisecond
 }
 
-func (rf *Raft) getLog(index int) LogEntry {
-	return rf.log[index]
-}
+// func (rf *Raft) getLog(index int) LogEntry {
+// 	return rf.log[index]
+// }
 
-func (rf *Raft) getLogsByRange(stratIndex int, endIndex int) []LogEntry {
-	s := max(stratIndex, 0)
-	e := min(endIndex, len(rf.log))
+// func (rf *Raft) getLogsByRange(stratIndex int, endIndex int) []LogEntry {
+// 	s := max(stratIndex, 0)
+// 	e := min(endIndex, len(rf.log))
 
-	return rf.log[s:e]
-}
+// 	return rf.log[s:e]
+// }
 
-func (rf *Raft) getLogLength() int {
-	return len(rf.log)
+// func (rf *Raft) getLogLength() int {
+// 	return len(rf.log)
 }
 
 // return currentTerm and whether this server
@@ -201,13 +201,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 	// TODO: remove logOffset
-	if args.PrevLogIndex >= rf.getLogLength() || rf.getLog(args.PrevLogIndex).Term != args.PrevLogTerm {
-		if args.PrevLogIndex >= rf.getLogLength() {
-			reply.NextIndex = rf.getLogLength()
+	if args.PrevLogIndex >= len(rf.log) || rf.[args.PrevLogIndex].Term != args.PrevLogTerm {
+		if args.PrevLogIndex >= len(rf.log) {
+			reply.NextIndex = len(rf.log)
 		} else {
 			index := args.PrevLogIndex
-			targetTerm := rf.getLog(args.PrevLogIndex).Term
-			for index > 0 && rf.getLog(index-1).Term == targetTerm {
+			targetTerm := rf[args.PrevLogIndex].Term
+			for index > 0 && rf.log[index-1].Term == targetTerm {
 				index--
 			}
 			reply.NextIndex = index
@@ -216,20 +216,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	conflictIndex := min(rf.getLogLength(), len(args.Entries)+args.PrevLogIndex+1)
-	for i := args.PrevLogIndex + 1; i < rf.getLogLength() && i < len(args.Entries)+args.PrevLogIndex+1; i++ {
-		if rf.getLog(i).Term != args.Entries[i-args.PrevLogIndex-1].Term {
+	conflictIndex := min(len(rf.log), len(args.Entries)+args.PrevLogIndex+1)
+	for i := args.PrevLogIndex + 1; i < len(rf.log) && i < len(args.Entries)+args.PrevLogIndex+1; i++ {
+		if rf.log[i].Term != args.Entries[i-args.PrevLogIndex-1].Term {
 			conflictIndex = i
 			break
 		}
 	}
 	// if current log contains all entries, don't truncate the log.
 	if conflictIndex != len(args.Entries)+args.PrevLogIndex+1 {
-		rf.log = append(rf.getLogsByRange(0, conflictIndex), args.Entries[conflictIndex-(args.PrevLogIndex+1):]...)
+		rf.log = append(rf.log[0, conflictIndex], args.Entries[conflictIndex-(args.PrevLogIndex+1):]...)
 	}
 
 	if args.CommitIndex > rf.commitIndex {
-		rf.commitIndex = min(args.CommitIndex, rf.getLogLength()-1)
+		rf.commitIndex = min(args.CommitIndex, len(rf.log)-1)
 	}
 	rf.msgRecieved = true
 	rf.persist()
@@ -272,9 +272,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
-	lastIndex := rf.getLogLength() - 1
-	if rf.getLog(lastIndex).Term > args.LastLogTerm ||
-		(rf.getLog(lastIndex).Term == args.LastLogTerm && lastIndex > args.LastLogIndex) {
+	lastIndex := len(rf.log) - 1
+	if rf.log[lastIndex].Term > args.LastLogTerm ||
+		(rf.log[lastIndex].Term == args.LastLogTerm && lastIndex > args.LastLogIndex) {
 		return
 	}
 	if args.Term < rf.currentTerm {
@@ -345,7 +345,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	rf.mu.Lock()
-	index = rf.getLogLength()
+	index = len(rf.log)
 	term = rf.currentTerm
 	isLeader = rf.state == LEADER
 
@@ -361,10 +361,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 func (rf *Raft) getAppendEntriesArgs(nextIndex int) (*AppendEntriesArgs, bool) {
 	// Entries can be [], which represents HeartBeat.
-	entries := rf.getLogsByRange(nextIndex, rf.getLogLength())
+	entries := rf.log[nextIndex, len(rf.log)]
 	prevIndex := nextIndex - 1
 	args := &AppendEntriesArgs{rf.currentTerm, rf.me, prevIndex,
-		rf.getLog(prevIndex).Term, entries, rf.commitIndex}
+		rf.log[prevIndex].Term, entries, rf.commitIndex}
 	isLeader := rf.state == LEADER
 
 	return args, isLeader
@@ -530,7 +530,7 @@ func (rf *Raft) handleElection(term int) {
 
 	votedChan := make(chan bool)
 	rf.mu.Lock()
-	args := RequestVoteArgs{term, rf.me, rf.getLogLength() - 1, rf.getLog(rf.getLogLength() - 1).Term}
+	args := RequestVoteArgs{term, rf.me, len(rf.log) - 1, rf.log[len(rf.log) - 1].Term}
 	rf.mu.Unlock()
 	for idx, _ := range rf.peers { // send vote request to everyone
 		if idx != rf.me {
@@ -571,7 +571,7 @@ func (rf *Raft) handleElection(term int) {
 			rf.nextIndex = make([]int, len(rf.peers))
 			rf.matchIndex = make([]int, len(rf.peers))
 			for idx, _ := range rf.nextIndex {
-				rf.nextIndex[idx] = rf.getLogLength()
+				rf.nextIndex[idx] = len(rf.log)
 			}
 			DPrintf("Term[%d] -- Peer[%d] changed to Leader.\n", rf.currentTerm, rf.me)
 		}
@@ -668,7 +668,7 @@ func (rf *Raft) loopForApplyMsg() {
 	for {
 		rf.mu.Lock()
 		for rf.lastCommitIndex < rf.commitIndex {
-			msg := ApplyMsg{rf.lastCommitIndex + 1, rf.getLog(rf.lastCommitIndex + 1).Command, false, []byte{}}
+			msg := ApplyMsg{rf.lastCommitIndex + 1, rf.log[rf.lastCommitIndex + 1].Command, false, []byte{}}
 			DPrintf("Term[%d] -- Peer[%d] sending applyMsg: %v.  -- %v\n", rf.currentTerm, rf.me, msg, rf.log)
 			rf.lastCommitIndex++
 			rf.applyCh <- msg
