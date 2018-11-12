@@ -480,7 +480,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.checkElectionTimeout() // Candidate and Follower routine
 
 	go rf.loopForAppendEntries() // Leader routine
-	// go rf.updateCommitIndex()    // Leader routine
+	go rf.updateCommitIndex()    // Leader routine
 
 	go rf.loopForApplyMsg() // Common routine
 
@@ -623,26 +623,28 @@ func (rf *Raft) updateCurrentTerm(term int) {
 }
 
 func (rf *Raft) updateCommitIndex() {
-	rf.mu.Lock()
-
-	if rf.state == Leader {
-		total := len(rf.matchIndex)
-		sortedMatchIndex := make([]int, total)
-		copy(sortedMatchIndex, rf.matchIndex)
-		sort.Ints(sortedMatchIndex)
-		medianIndex := sortedMatchIndex[(total+1)/2]
-
-		for medianIndex > rf.commitIndex {
-			if medianIndex < rf.getLogLength() && rf.getLog(medianIndex).Term == rf.currentTerm {
-				rf.commitIndex = medianIndex
-				DPrintf("Term[%d] -- Peer[%d] update commitIndex: %d from most agreement - %v.\n",
-					rf.currentTerm, rf.me, rf.commitIndex, rf.matchIndex)
-				break
+	for {
+		rf.mu.Lock()
+		if rf.state == Leader {
+			total := len(rf.matchIndex)
+			sortedMatchIndex := make([]int, total)
+			copy(sortedMatchIndex, rf.matchIndex)
+			sort.Ints(sortedMatchIndex)
+			medianIndex := sortedMatchIndex[(total+1)/2]
+	
+			for medianIndex > rf.commitIndex {
+				if medianIndex < rf.getLogLength() && rf.getLog(medianIndex).Term == rf.currentTerm {
+					rf.commitIndex = medianIndex
+					DPrintf("Term[%d] -- Peer[%d] update commitIndex: %d from most agreement - %v.\n",
+						rf.currentTerm, rf.me, rf.commitIndex, rf.matchIndex)
+					break
+				}
+				medianIndex--
 			}
-			medianIndex--
 		}
+		rf.mu.Unlock()
+		time.Sleep(time.Duration(ServerSleepTime)*time.Millisecond) // an infinite loop must sleep for some time, otherwise deadlock
 	}
-	rf.mu.Unlock()
 
 }
 
@@ -656,7 +658,6 @@ func (rf *Raft) loopForApplyMsg() {
 			rf.applyCh <- msg
 		}
 		rf.mu.Unlock()
-		rf.updateCommitIndex()
 		time.Sleep(time.Duration(ServerSleepTime) * time.Millisecond)
 	}
 }
