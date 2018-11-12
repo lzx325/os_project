@@ -20,7 +20,7 @@ package raft
 
 import (
 	"labrpc"
-	"log"
+	// "log"
 	"math/rand"
 	"sort"
 	"sync"
@@ -86,7 +86,7 @@ type Raft struct {
 	currentTerm int
 	votedFor    int
 	log         []Log
-	logOffset   int // index offset for log compaction
+	// logOffset   int // index offset for log compaction
 
 	receivedHeartBeat bool
 	state             State
@@ -97,8 +97,7 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
-	applyCh      chan ApplyMsg
-	snapshotData []byte
+	applyCh chan ApplyMsg
 }
 
 func randElectionTimeout() time.Duration {
@@ -107,18 +106,18 @@ func randElectionTimeout() time.Duration {
 }
 
 func (rf *Raft) getLog(index int) Log {
-	return rf.log[index-rf.logOffset]
+	return rf.log[index]
 }
 
 func (rf *Raft) getLogsByRange(stratIndex int, endIndex int) []Log {
-	s := max(stratIndex-rf.logOffset, 0)
-	e := min(endIndex-rf.logOffset, len(rf.log))
+	s := max(stratIndex, 0)
+	e := min(endIndex, len(rf.log))
 
 	return rf.log[s:e]
 }
 
 func (rf *Raft) getLogLength() int {
-	return rf.logOffset + len(rf.log)
+	return len(rf.log)
 }
 
 func (rf *Raft) GetStateSize() int {
@@ -204,13 +203,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
-	if args.PrevLogIndex < rf.logOffset || args.PrevLogIndex >= rf.getLogLength() || rf.getLog(args.PrevLogIndex).Term != args.PrevLogTerm {
-		if args.PrevLogIndex < rf.logOffset || args.PrevLogIndex >= rf.getLogLength() {
+	// TODO: remove logOffset
+	if args.PrevLogIndex >= rf.getLogLength() || rf.getLog(args.PrevLogIndex).Term != args.PrevLogTerm {
+		if args.PrevLogIndex >= rf.getLogLength() {
 			reply.ConflictIndex = rf.getLogLength()
 		} else {
 			index := args.PrevLogIndex
 			targetTerm := rf.getLog(args.PrevLogIndex).Term
-			for index > rf.logOffset && rf.getLog(index-1).Term == targetTerm {
+			for index > 0 && rf.getLog(index-1).Term == targetTerm {
 				index--
 			}
 			reply.ConflictIndex = index
@@ -408,7 +408,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = Follower
 	rf.votedFor = -1
 	rf.currentTerm = 0
-	rf.logOffset = 0
 	rf.log = []Log{Log{0, nil}} // add a head log to make index start from 1
 
 	rf.lastApplied = 0
@@ -445,28 +444,24 @@ func (rf *Raft) loopForAppendEntries() {
 						nextIndex := rf.nextIndex[server]
 						for nextIndex > 0 {
 							rf.mu.Lock()
-							if nextIndex > rf.logOffset {
-								args, isLeader := rf.getAppendEntriesArgs(nextIndex)
-								rf.mu.Unlock()
-								if !isLeader { // Important! State may change during this process.
-									return
-								}
-								reply := &AppendEntriesReply{-1, -1, false}
-								ok := rf.sendAppendEntries(server, args, reply)
-								rf.updateCurrentTerm(reply.Term)
-								if ok && reply.Success {
-									rf.mu.Lock()
-									rf.nextIndex[server] = nextIndex + len(args.Entries)
-									rf.matchIndex[server] = rf.nextIndex[server] - 1
-									rf.mu.Unlock()
-									break
-								} else if !reply.Success {
-									nextIndex = reply.ConflictIndex
-								}
-							} else {
-
-								log.Fatal("Snapshot not implemented")
+							args, isLeader := rf.getAppendEntriesArgs(nextIndex)
+							rf.mu.Unlock()
+							if !isLeader { // Important! State may change during this process.
+								return
 							}
+							reply := &AppendEntriesReply{-1, -1, false}
+							ok := rf.sendAppendEntries(server, args, reply)
+							rf.updateCurrentTerm(reply.Term)
+							if ok && reply.Success {
+								rf.mu.Lock()
+								rf.nextIndex[server] = nextIndex + len(args.Entries)
+								rf.matchIndex[server] = rf.nextIndex[server] - 1
+								rf.mu.Unlock()
+								break
+							} else if !reply.Success {
+								nextIndex = reply.ConflictIndex
+							}
+
 						}
 					}(idx)
 				}
