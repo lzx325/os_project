@@ -1,10 +1,8 @@
 package main
 
 import (
-// "fmt"
-// // "strconv"
-// "sync"
-// "time"
+	"fmt"
+	"time"
 )
 
 // import "time"
@@ -17,57 +15,20 @@ type A struct {
 func fun(obj *A) {
 	obj.a = 2
 }
+func compare(a, b time.Duration) bool {
+	return a < b
+}
 func main() {
-	// timer := time.NewTimer(10000 * time.Millisecond)
-	// wg := sync.WaitGroup{}
-	// wg.Add(1)
-	// go func() {
-	// 	fmt.Println("aaa")
-	// 	time.Sleep(3000 * time.Millisecond)
-	// 	fmt.Println("bbb")
-	// 	<-timer.C
-	// 	fmt.Println("ccc")
-	// 	wg.Done()
-	// }()
-	// if !timer.Stop() {
-	// 	<-timer.C
-	// }
-	// timer.Reset(4000 * time.Millisecond)
-	// a := 1
-	// switch a {
-	// case 1:
-	// }
-	// wg.Wait()
-	// s := struct{ t *time.Timer }{}
-	// fmt.Println(s)
-	// for i := 0; i < 20; i++ {
-	// 	fmt.Println(rand.Intn(5))
-
-	// }
-
-	// ch1 := make(chan int)
-	// ch2 := make(chan int)
-	// wg := sync.WaitGroup{}
-	// wg.Add(1)
-	// go func() {
-	// 	for {
-	// 		select {
-	// 		case ch1 <- 1:
-	// 			time.Sleep(1000 * time.Millisecond)
-	// 		case <-ch2:
-	// 			wg.Done()
-	// 			return
-	// 		}
-	// 	}
-	// 	wg.Done()
-	// }()
-	// fmt.Println(<-ch1)
-	// fmt.Println(<-ch1)
-	// ch2 <- 1
-
-	// wg.Wait()
-
-	ch1 := make(chan int)
-	ch1 <- 1
-
+	ch := make(chan int)
+	go func() {
+		time.Sleep(4 * time.Second)
+		ch <- 1
+	}()
+	timer := time.After(2 * time.Second)
+	select {
+	case <-ch:
+		fmt.Println("case 1")
+	case <-timer:
+		fmt.Println("case 2")
+	}
 }

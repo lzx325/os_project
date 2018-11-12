@@ -87,7 +87,11 @@ func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bo
 
 	qb := new(bytes.Buffer)
 	qe := gob.NewEncoder(qb)
-	qe.Encode(args)
+	//lizx: add error case
+	if err := qe.Encode(args); err != nil {
+		log.Fatalf("ClientEnd.Call(): encode failure")
+	}
+
 	req.args = qb.Bytes()
 
 	e.ch <- req
@@ -429,7 +433,9 @@ func (svc *Service) dispatch(methname string, req reqMsg) replyMsg {
 		// decode the argument.
 		ab := bytes.NewBuffer(req.args)
 		ad := gob.NewDecoder(ab)
-		ad.Decode(args.Interface())
+		if err := ad.Decode(args.Interface()); err != nil {
+			log.Fatalf("decode error")
+		}
 
 		// allocate space for the reply.
 		replyType := method.Type.In(2)
@@ -438,6 +444,9 @@ func (svc *Service) dispatch(methname string, req reqMsg) replyMsg {
 
 		// call the method.
 		function := method.Func
+		//lizx:
+		argsElem := args.Elem().Interface()
+		_ = argsElem
 		function.Call([]reflect.Value{svc.rcvr, args.Elem(), replyv})
 
 		// encode the reply.
