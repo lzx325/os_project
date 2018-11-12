@@ -165,26 +165,31 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	rf.updateCurrentTermNoLock(args.Term)
 
-	reply.Success = true
 	reply.Term = rf.currentTerm
-	reply.NextIndex = args.PrevLogIndex
 
 	if args.Term < rf.currentTerm {
 		reply.Success = false
+		reply.NextIndex = args.PrevLogIndex
+		rf.msgRecieved = true
 		return
 	}
-	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		if args.PrevLogIndex >= len(rf.log) {
-			reply.NextIndex = len(rf.log)
-		} else {
-			index := args.PrevLogIndex
-			targetTerm := rf.log[args.PrevLogIndex].Term
-			for index > 0 && rf.log[index-1].Term == targetTerm {
-				index--
-			}
-			reply.NextIndex = index
-		}
+
+	if args.PrevLogIndex >= len(rf.log) {
 		reply.Success = false
+		reply.NextIndex = len(rf.log)
+		rf.msgRecieved = true
+		return
+	}
+
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		index := args.PrevLogIndex
+		targetTerm := rf.log[args.PrevLogIndex].Term
+		for index > 0 && rf.log[index-1].Term == targetTerm {
+			index--
+		}
+		reply.NextIndex = index
+		reply.Success = false
+		rf.msgRecieved = true
 		return
 	}
 
@@ -202,6 +207,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.CommitIndex > rf.commitIndex {
 		rf.commitIndex = min(args.CommitIndex, len(rf.log)-1)
 	}
+	reply.NextIndex = args.PrevLogIndex
+	reply.Success = true
 	rf.msgRecieved = true
 	rf.persist()
 }
@@ -229,25 +236,26 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.updateCurrentTermNoLock(args.Term)
 
 	reply.Term = rf.currentTerm
-	reply.VoteGranted = false
 
 	lastIndex := len(rf.log) - 1
-	if rf.log[lastIndex].Term > args.LastLogTerm ||
-		(rf.log[lastIndex].Term == args.LastLogTerm && lastIndex > args.LastLogIndex) {
+	if rf.log[lastIndex].Term > args.LastLogTerm || (rf.log[lastIndex].Term == args.LastLogTerm && lastIndex > args.LastLogIndex) {
+		reply.VoteGranted = false
 		return
 	}
 	if args.Term < rf.currentTerm {
+		reply.VoteGranted = false
+
 		return
 	}
 	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
+		reply.VoteGranted = false
+
 		return
 	}
 
 	reply.VoteGranted = true
 	rf.votedFor = args.CandidateId
-	if rf.state == FOLLOWER {
-		rf.msgRecieved = true
-	}
+	rf.msgRecieved = true
 	rf.persist()
 }
 
@@ -299,22 +307,17 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	rf.mu.Lock()
-	index = len(rf.log)
-	term = rf.currentTerm
-	isLeader = rf.state == LEADER
-
-	if isLeader {
-		rf.log = append(rf.log, LogEntry{term, command})
+	isleader := rf.state == LEADER
+	term := rf.currentTerm
+	index := len(rf.log)
+	if rf.state == LEADER {
+		rf.log = append(rf.log, LogEntry{rf.currentTerm, command})
 		rf.persist()
 	}
 	rf.mu.Unlock()
 
-	return index, term, isLeader
+	return index, term, isleader
 }
 
 //
@@ -344,17 +347,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	rf.msgRecieved = false
+	rf.log = []LogEntry{LogEntry{0, nil}}
 	rf.state = FOLLOWER
 	rf.votedFor = -1
 	rf.currentTerm = 0
-	rf.log = []LogEntry{LogEntry{0, nil}}
-
-	rf.lastCommitIndex = 0
 	rf.commitIndex = 0
-
-	rf.nextIndex = make([]int, len(rf.peers))
+	rf.lastCommitIndex = 0
 	rf.matchIndex = make([]int, len(rf.peers))
-
+	rf.nextIndex = make([]int, len(rf.peers))
 	rf.applyCh = applyCh
 	rf.readPersist(persister.ReadRaftState())
 
