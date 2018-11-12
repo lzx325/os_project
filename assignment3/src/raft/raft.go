@@ -20,6 +20,7 @@ package raft
 
 import (
 	"labrpc"
+	"log"
 	"math/rand"
 	"sort"
 	"sync"
@@ -328,51 +329,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-type InstallSnapshotArgs struct {
-	Term              int
-	LastIncludedIndex int
-	LastIncludedTerm  int
-	Data              []byte
-}
-
-type InstallSnapshotReply struct {
-	Term int
-}
-
-func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
-	rf.updateCurrentTerm(args.Term)
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	reply.Term = rf.currentTerm
-	if args.Term < rf.currentTerm {
-		return
-	}
-
-	if rf.getLogLength() > args.LastIncludedIndex && rf.logOffset <= args.LastIncludedIndex &&
-		rf.getLog(args.LastIncludedIndex).Term == args.LastIncludedTerm {
-		rf.log = rf.getLogsByRange(args.LastIncludedIndex, rf.getLogLength())
-	} else {
-		rf.log = []Log{Log{args.LastIncludedTerm, nil}}
-	}
-	rf.logOffset = args.LastIncludedIndex
-	rf.receivedHeartBeat = true
-
-	msg := ApplyMsg{Index: args.LastIncludedIndex, UseSnapshot: true, Snapshot: args.Data}
-
-	rf.applyCh <- msg
-	rf.lastApplied = args.LastIncludedIndex
-	rf.commitIndex = args.LastIncludedIndex
-	rf.snapshotData = args.Data
-	rf.persist()
-	rf.saveSnapshot()
-}
-
-func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
-	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
-	return ok
-}
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -412,13 +368,6 @@ func (rf *Raft) getAppendEntriesArgs(nextIndex int) (*AppendEntriesArgs, bool) {
 	prevIndex := nextIndex - 1
 	args := &AppendEntriesArgs{rf.currentTerm, rf.me, prevIndex,
 		rf.getLog(prevIndex).Term, entries, rf.commitIndex}
-	isLeader := rf.state == Leader
-
-	return args, isLeader
-}
-
-func (rf *Raft) getInstallSnapshotArgs() (*InstallSnapshotArgs, bool) {
-	args := &InstallSnapshotArgs{rf.currentTerm, rf.logOffset, rf.log[0].Term, rf.snapshotData}
 	isLeader := rf.state == Leader
 
 	return args, isLeader
@@ -471,7 +420,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-	rf.readSnapshot(persister.ReadSnapshot())
 
 	// create a background goroutine that will kick off
 	// leader election periodically by sending out RequestVote
@@ -516,21 +464,8 @@ func (rf *Raft) loopForAppendEntries() {
 									nextIndex = reply.ConflictIndex
 								}
 							} else {
-								args, isLeader := rf.getInstallSnapshotArgs()
-								rf.mu.Unlock()
-								if !isLeader {
-									return
-								}
-								reply := &InstallSnapshotReply{-1}
-								ok := rf.sendInstallSnapshot(server, args, reply)
-								rf.updateCurrentTerm(reply.Term)
-								if ok {
-									rf.mu.Lock()
-									rf.nextIndex[server] = rf.logOffset + 1
-									rf.matchIndex[server] = rf.nextIndex[server] - 1
-									rf.mu.Unlock()
-									break
-								}
+
+								log.Fatal("Snapshot not implemented")
 							}
 						}
 					}(idx)
@@ -599,7 +534,7 @@ func (rf *Raft) checkElectionTimeout() {
 		rf.mu.Lock()
 		if rf.state != Leader && !rf.receivedHeartBeat {
 			rf.state = Candidate
-			rf.currentTerm += 1
+			rf.currentTerm++
 			rf.votedFor = rf.me
 			DPrintf("Term[%d] -- Peer[%d] changed to Candidate.\n", rf.currentTerm, rf.me)
 			rf.persist()
@@ -631,7 +566,7 @@ func (rf *Raft) updateCommitIndex() {
 			copy(sortedMatchIndex, rf.matchIndex)
 			sort.Ints(sortedMatchIndex)
 			medianIndex := sortedMatchIndex[(total+1)/2]
-	
+
 			for medianIndex > rf.commitIndex {
 				if medianIndex < rf.getLogLength() && rf.getLog(medianIndex).Term == rf.currentTerm {
 					rf.commitIndex = medianIndex
@@ -643,7 +578,7 @@ func (rf *Raft) updateCommitIndex() {
 			}
 		}
 		rf.mu.Unlock()
-		time.Sleep(time.Duration(ServerSleepTime)*time.Millisecond) // an infinite loop must sleep for some time, otherwise deadlock
+		time.Sleep(time.Duration(ServerSleepTime) * time.Millisecond) // an infinite loop must sleep for some time, otherwise deadlock
 	}
 
 }
@@ -660,52 +595,4 @@ func (rf *Raft) loopForApplyMsg() {
 		rf.mu.Unlock()
 		time.Sleep(time.Duration(ServerSleepTime) * time.Millisecond)
 	}
-}
-
-type Snapshot struct {
-	Data              []byte
-	LastIncludedIndex int
-	LastIncludedTerm  int
-}
-
-func (rf *Raft) UpdateSnapshot(data []byte, index int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if index < rf.logOffset || index >= rf.getLogLength() {
-		return
-	}
-	rf.snapshotData = data
-	rf.log = rf.getLogsByRange(index, rf.getLogLength())
-	rf.logOffset = index
-	rf.lastApplied = index
-	DPrintf("Term[%d] -- Peer[%d] changed logOffset to %d", rf.currentTerm, rf.me, rf.logOffset)
-	rf.saveSnapshot()
-	rf.persist()
-}
-
-func (rf *Raft) saveSnapshot() {
-	w := new(bytes.Buffer)
-	e := gob.NewEncoder(w)
-	e.Encode(Snapshot{rf.snapshotData, rf.logOffset, rf.log[0].Term})
-	rf.persister.SaveSnapshot(w.Bytes())
-}
-
-func (rf *Raft) readSnapshot(data []byte) {
-	if data == nil || len(data) < 1 {
-		return
-	}
-	snapshot := Snapshot{[]byte{}, 0, 0}
-	r := bytes.NewBuffer(data)
-	d := gob.NewDecoder(r)
-	d.Decode(&snapshot)
-
-	rf.logOffset = snapshot.LastIncludedIndex
-	rf.lastApplied = snapshot.LastIncludedIndex
-	rf.commitIndex = snapshot.LastIncludedIndex
-	rf.snapshotData = snapshot.Data
-
-	msg := ApplyMsg{Index: snapshot.LastIncludedIndex, UseSnapshot: true, Snapshot: snapshot.Data}
-	go func() {
-		rf.applyCh <- msg
-	}()
 }
